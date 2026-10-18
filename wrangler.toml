@@ -1,0 +1,7 @@
+name = "apk-verify"
+main = "index.js"
+compatibility_date = "2024-11-01"
+workers_dev = true
+
+# Secrets (FB_URL, FB_CLIENT_EMAIL, FB_PRIVATE_KEY, UPLOAD_SECRET, BOT_TOKEN, CHAT_ID)
+# are NOT set here — add them in the dashboard: Worker → Settings → Variables and Secrets.
