@@ -216,6 +216,119 @@ export default {
       }
     }
 
+    // /nc/diag : read-only — explains the verify decision (no token, no secrets). Open in a browser:
+    //   /nc/diag?pkg=com.x&aid=<android_id>&key=<saved_key>
+    if (path === "/nc/diag" && request.method === "GET") {
+      const out = { ok:true };
+      try {
+        const authQ = await fbAuthParam(env);
+        out.worker_config = authQ ? "ok" : "MISSING FB creds";
+        if (!authQ) return J(out, 200);
+        const pkgRaw = String(url.searchParams.get("pkg")||"").trim();
+        const aid = String(url.searchParams.get("aid")||"").trim();
+        const key = String(url.searchParams.get("key")||"").trim();
+        const pkg = pkgRaw.replace(/\./g, ",");
+        const fb = (p) => `${env.FB_URL}/${p}.json?${authQ}`;
+        out.pkg = pkg; out.aid = aid || "(none)"; out.key = key || "(none)";
+        const settings = (await (await fetch(fb(`public_data/settings/apps/${pkg}`))).json()) || {};
+        out.mode = String(settings.global_maintenance||"normal");
+        const mk = (await (await fetch(fb(`admin_config/nc_key`))).json()) || {};
+        out.master_key = /^[A-Za-z0-9+/=]{40,}$/.test(String(mk.key||"")) ? "set" : "MISSING";
+        const blob = (await (await fetch(fb(`netcheck/${pkg}`))).json());
+        out.dex_uploaded = blob && blob.enc ? ("yes v"+(blob.ver||1)) : "NO BLOB for this pkg";
+        const sigRec = (await (await fetch(fb(`app_sig/${pkg}`))).json()) || {};
+        out.signature = { stored: /^[0-9a-f]{64}$/.test(String(sigRec.sha||"")), enforce: sigRec.enforce===true };
+        const today = istDate(Date.now());
+        let u = key ? await (await fetch(fb(`public_data/users/${pkg}/${key}`))).json() : null;
+        out.key_lookup = u ? { found:true, status:u.status||"(none)", expiry:u.expiry||"(none)", android_id:u.android_id||"(none)", expired: !!(u.expiry && today > String(u.expiry)) } : { found:false };
+        // android_id fallback (reports if the index is missing)
+        out.aid_fallback = "(not tried)";
+        if (aid) {
+          try {
+            const r = await fetch(`${env.FB_URL}/public_data/users/${pkg}.json?${authQ}&orderBy=${encodeURIComponent('"android_id"')}&equalTo=${encodeURIComponent('"'+aid+'"')}`);
+            const txt = await r.text();
+            if (!r.ok || /Index not defined|indexOn/i.test(txt)) out.aid_fallback = "INDEX MISSING — add \".indexOn\":[\"android_id\"] to rules";
+            else { const q = JSON.parse(txt)||{}; const keys = Object.keys(q); out.aid_fallback = keys.length ? ("matched key "+keys[0]+" status "+(q[keys[0]].status||"?")) : "no user bound to this android_id"; }
+          } catch (e) { out.aid_fallback = "query error: "+String(e&&e.message||e); }
+        }
+        const okUser = (x) => x && (String(x.status||"active")==="active"||String(x.status||"active")==="online") && !(x.expiry && today > String(x.expiry));
+        let allow = out.mode==="allow_all";
+        if (!allow) { if (okUser(u) && (!u.android_id || String(u.android_id)===aid)) allow=true; else if (/matched key/.test(out.aid_fallback)) allow=true; }
+        out.WOULD_DOWNLOAD = allow;
+        return J(out, 200);
+      } catch (e) { out.error = String(e&&e.message||e); return J(out, 200); }
+    }
+
+    // ========================= NETCHECK — protected-dex delivery =========================
+    // /nc/ping : verify license (+signature if enforced), issue one-time token + session key
+    if (path === "/nc/ping" && request.method === "POST") {
+      if (!env.FB_URL) return J({ ok:false, reason:"server_not_configured" }, 500);
+      try {
+        const authQ = await fbAuthParam(env); if (!authQ) return J({ ok:false, reason:"server_not_configured" }, 500);
+        const b = await request.json();
+        const aid = String(b.aid||"").trim(), pkgRaw = String(b.pkg||"").trim(), key = String(b.key||"").trim();
+        const sig = String(b.sig||"").toLowerCase().replace(/[^0-9a-f]/g,"");
+        if (!aid || !pkgRaw) return J({ ok:false, reason:"bad_request" }, 400);
+        const pkg = pkgRaw.replace(/\./g, ",");
+        const fb = (p) => `${env.FB_URL}/${p}.json?${authQ}`;
+        const settings = (await (await fetch(fb(`public_data/settings/apps/${pkg}`))).json()) || {};
+        const mode = String(settings.global_maintenance||"normal");
+        if (mode !== "allow_all") {
+          const today = istDate(Date.now());
+          const okUser = (x) => x && (function(){ const st=String(x.status||"active"); if(st!=="active"&&st!=="online") return false; if(x.expiry && today > String(x.expiry)) return false; return true; })();
+          // 1) try the device's saved key (unbound key, or one bound to THIS device)
+          let u = key ? await (await fetch(fb(`public_data/users/${pkg}/${key}`))).json() : null;
+          let good = okUser(u) && (!u.android_id || String(u.android_id) === aid);
+          // 2) fallback — same as the login: accept any active key bound to this android_id
+          if (!good && aid) {
+            try {
+              const q = await (await fetch(`${env.FB_URL}/public_data/users/${pkg}.json?${authQ}&orderBy=${encodeURIComponent('"android_id"')}&equalTo=${encodeURIComponent('"'+aid+'"')}`)).json() || {};
+              for (const k in q) { if (okUser(q[k])) { u = q[k]; good = true; break; } }
+            } catch (e) { }
+          }
+          if (!good) return J({ ok:false, reason: (u ? (okUser(u) ? "mismatch" : "blocked_or_expired") : "no_user") }, 403);
+        }
+        const sigRec = (await (await fetch(fb(`app_sig/${pkg}`))).json()) || {};
+        const expSig = String(sigRec.sha||"").toLowerCase();
+        const bind = /^[0-9a-f]{64}$/.test(expSig);
+        if (sigRec.enforce === true && (!bind || sig !== expSig)) return J({ ok:false, reason:"sig_mismatch" }, 403);
+        const skBytes = crypto.getRandomValues(new Uint8Array(32));
+        const token = rand(12) + rand(12) + rand(8);
+        await fetch(fb(`nc_tokens/${token}`), { method:"PUT", body: JSON.stringify({ sk: b64(skBytes), pkg, aid, bind, exp: Date.now()+120000, used:false }) });
+        return J({ ok:true, token, sk: b64(skBytes), bind });
+      } catch (e) { return J({ ok:false, reason:"error", message:String(e&&e.message||e) }, 500); }
+    }
+    // /nc/sync : token -> dex re-encrypted under SHA256(sessionKey [|| expectedSig])
+    if (path === "/nc/sync" && request.method === "POST") {
+      if (!env.FB_URL) return J({ ok:false, reason:"server_not_configured" }, 500);
+      try {
+        const authQ = await fbAuthParam(env); if (!authQ) return J({ ok:false, reason:"server_not_configured" }, 500);
+        const b = await request.json(); const token = String(b.token||"").trim();
+        if (!token || /[.#$\[\]\/]/.test(token)) return J({ ok:false, reason:"bad_request" }, 400);
+        const fb = (p) => `${env.FB_URL}/${p}.json?${authQ}`;
+        const t = await (await fetch(fb(`nc_tokens/${token}`))).json();
+        if (!t || t.used || Date.now() > (+t.exp||0)) return J({ ok:false, reason:"bad_token" }, 403);
+        await fetch(fb(`nc_tokens/${token}`), { method:"PATCH", body: JSON.stringify({ used:true }) });
+        const pkg = t.pkg;
+        const mkRec = (await (await fetch(fb(`admin_config/nc_key`))).json()) || {};
+        const mk = b64d(String(mkRec.key||"")); if (mk.length !== 32) return J({ ok:false, reason:"no_master_key" }, 500);
+        const blob = await (await fetch(fb(`netcheck/${pkg}`))).json();
+        if (!blob || !blob.enc) return J({ ok:false, reason:"no_dex" }, 404);
+        const masterKey = await crypto.subtle.importKey("raw", mk, { name:"AES-GCM" }, false, ["decrypt"]);
+        const raw = new Uint8Array(await crypto.subtle.decrypt({ name:"AES-GCM", iv: b64d(blob.iv) }, masterKey, b64d(blob.enc)));
+        let material = b64d(t.sk);
+        if (t.bind) {
+          const sigRec = (await (await fetch(fb(`app_sig/${pkg}`))).json()) || {};
+          material = concat(material, hex2bytes(String(sigRec.sha||"")));
+        }
+        const realRaw = new Uint8Array(await crypto.subtle.digest("SHA-256", material));
+        const realKey = await crypto.subtle.importKey("raw", realRaw, { name:"AES-GCM" }, false, ["encrypt"]);
+        const iv2 = crypto.getRandomValues(new Uint8Array(12));
+        const ct2 = new Uint8Array(await crypto.subtle.encrypt({ name:"AES-GCM", iv: iv2 }, realKey, raw));
+        return J({ ok:true, iv: b64(iv2), data: b64(ct2), ver: blob.ver||1 });
+      } catch (e) { return J({ ok:false, reason:"error", message:String(e&&e.message||e) }, 500); }
+    }
+
     // --- upload screenshot ---
     if (path === "/upload" && request.method === "POST") {
       if (env.UPLOAD_SECRET && request.headers.get("x-auth") !== env.UPLOAD_SECRET) return new Response("unauthorized", { status: 401, headers: cors });
@@ -311,3 +424,8 @@ async function importPkcs8(pem) {
 }
 function b64url(str) { return btoa(unescape(encodeURIComponent(str))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
 function b64urlBytes(bytes) { let s = ""; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]); return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
+
+function b64(bytes){ let s=""; const B=new Uint8Array(bytes); for(let i=0;i<B.length;i++) s+=String.fromCharCode(B[i]); return btoa(s); }
+function b64d(str){ const bin=atob(String(str||"")); const a=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) a[i]=bin.charCodeAt(i); return a; }
+function hex2bytes(h){ h=String(h||"").toLowerCase().replace(/[^0-9a-f]/g,""); const a=new Uint8Array(h.length>>1); for(let i=0;i<a.length;i++) a[i]=parseInt(h.substr(i*2,2),16); return a; }
+function concat(a,b){ const o=new Uint8Array(a.length+b.length); o.set(a,0); o.set(b,a.length); return o; }
